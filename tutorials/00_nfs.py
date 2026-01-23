@@ -5,6 +5,7 @@
 from collections.abc import Callable
 from typing import TypeAlias
 
+import diffrax as dfx
 import jax
 from jax import Array
 from jax import scipy as jsp
@@ -193,7 +194,6 @@ ax1.hist(x1_model.flatten(), bins=50, density=True, alpha=0.5, label="Learned Mo
 ax1.set_title("Data Space (x1)")
 ax1.legend()
 
-# %%
 # Plot 2: Check Latent Space (Should be Standard Normal)
 ax2 = plt.subplot(1, 2, 2)
 x0_mapped, _ = inverse_flow(params, x1_samples)
@@ -207,5 +207,75 @@ ax2.legend()
 plt.tight_layout()
 plt.show()
 
-# %% multiple nfs
-# ...
+# %% [markdown]
+# ## Multiple NFs
+# - $p_k(x_k) = p_0(x_0) \prod_i^k |\det {\frac{\partial \phi_i(x_i)}{\partial x_i}}^{-1}|$
+# - $\log p_k(x_k) = \log p_0(x_0) - \sum_i^k \log |\det {\frac{\partial \phi_i(x_i)}{\partial x_i}}|$
+# - Minimize the negative log likelihood
+# - $\min -\log p_k(x_k) = -\log p_0(x_0) + \sum_i^k \log |\det {\frac{\partial \phi_i(x_i)}{\partial x_i}}|$
+
+# ## Continuous Normalizing Flows
+# ### ODE
+# - Different from discrete nfs, cnfs see the transformation as an ODE
+# - $\frac{dx_t}{dt} = u_t(x_t)$, similar with 1st-order ODE, where $u_t$ is the velocity field, describing the instantaneous change of $x_t$
+# ### Transport Equation / Continuity Equation
+# - $\frac{dp_t(x_t)}{dt} = -\nabla \cdot (p_t(x_t) u_t(x_t))$
+# - the change of probability w.r.t time is equal to the divergence of the probability flow (velocity field times probability density w.r.t position)
+
+
+# %% CNFs
+def solve_u_logp(params, x1, t0, t1):
+    def u(t, x):  # velocity field
+        return params["loc"]
+
+    def div_fn(t, x):
+        jac = jax.jacobian(u, argnums=1)(t, x)
+        return jnp.trace(jac)
+
+    def dyn(t, z, args):
+        x, logp = z
+        dxdt = u(t, x)
+        dlogpdt = -div_fn(t, x)
+        return (dxdt, dlogpdt)
+
+    term = dfx.ODETerm(dyn)
+    solver = dfx.Euler()
+    init_guess = (x1, 0.0)
+    sol = dfx.diffeqsolve(term, solver, t0, t1, (t1 - t0) / 20, init_guess)
+    x0, delta_logp = jax.tree.map(lambda x: x[-1], sol.ys)
+    log_p_x0 = jsp.stats.norm.logpdf(x0)  # noise
+    return x0, log_p_x0 + delta_logp
+
+
+@jax.jit
+def loss_fn(params, x1, *args):
+    batched_solve = jax.vmap(solve_u_logp, in_axes=(None, 0, None, None))
+    x0s, logp1s = batched_solve(params, x1, *args)
+    return -jnp.mean(logp1s)
+
+
+params = {"loc": jnp.zeros((1,))}
+target_params = {"loc": jnp.array([4.0])}
+train_key, _ = jax.random.split(RNDKey)
+x1_samples = target_params["loc"] * 1.0 + jax.random.normal(train_key, (1000, 1))
+lr = 1e-1
+
+val_grad_fn = jax.jit(jax.value_and_grad(loss_fn))
+
+for step in range(1000):
+    loss, grads = val_grad_fn(params, x1_samples, 1.0, 0.0)
+    params = {"loc": params["loc"] - lr * grads["loc"]}
+    if step % 100 == 0:
+        print(f"Step {step:03d} | Loss: {loss:.4f}")
+
+print(f"Learned: loc={params['loc'][0]:.4f}")
+print(f"Target:  loc={target_params['loc'][0]:.4f}")
+
+# %%
+t_span = jnp.linspace(0.0, 1.0, 100)
+x1_span = jnp.linspace(-10, 10, 1000)
+x_logp_fn = jax.vmap(jax.vmap(solve_u_logp, in_axes=(None, 0, None, None)), in_axes=(None, None, 0, None))
+x0, logp = x_logp_fn(params, x1_span[:, None], t_span, 0.0)
+T, X = jnp.meshgrid(t_span, x_span.squeeze())
+plt.contourf(T, X, jnp.exp(logp).squeeze().T, levels=50)
+# %%
